@@ -86,6 +86,8 @@ class SearchSession:
         self.queries: list[str] = []
         self.urls: dict[str, str] = {}  # url -> title (keeps order)
         self.errors: list[str] = []     # search problems, shown in the UI
+        self.log: list[tuple[str, str, int]] = []  # (query, engine used, result count)
+        self.last_engine = ""
         self.lock = threading.Lock()
 
 
@@ -132,6 +134,7 @@ def web_search_with_fallback(query: str, session: "SearchSession", max_results: 
         try:
             found = _tavily_search(query, session.tavily_key, max_results)
             if found:
+                session.last_engine = "Tavily"
                 return found, None
             last_error = RuntimeError("empty result")
         except Exception as exc:
@@ -152,6 +155,7 @@ def web_search_with_fallback(query: str, session: "SearchSession", max_results: 
                     backend=backend,
                 )
                 if found:
+                    session.last_engine = f"free:{backend}"
                     return found, None
                 last_error = RuntimeError("empty result")
             except Exception as exc:  # blocked, rate limited, parse error...
@@ -162,15 +166,32 @@ def web_search_with_fallback(query: str, session: "SearchSession", max_results: 
     return None, last_error
 
 
-def make_search_tool(session: SearchSession):
+STOPWORDS = {"a", "an", "the", "for", "of", "and", "or", "to", "in", "on", "with", "best", "top"}
+
+
+def ensure_product_in_query(query: str, product: str) -> str:
+    """Stop the model from searching single loose words like 'working' or 'office'.
+    If less than the main words of the product appear in the query, add the full product name."""
+    core = [w for w in re.findall(r"[a-z0-9]+", product.lower()) if w not in STOPWORDS]
+    if not core:
+        return query
+    q_words = set(re.findall(r"[a-z0-9]+", query.lower()))
+    hits = sum(1 for w in core if w in q_words)
+    if hits * 2 < len(core) or hits == 0:
+        return f"{product} {query}".strip()
+    return query
+
+
+def make_search_tool(session: SearchSession, product: str):
     @tool("DuckDuckGo Web Search")
     def duckduckgo_search(query: str) -> str:
-        """Search the live web with DuckDuckGo. Input must be one short search
-        query string, for example: 'minimalist leather wallet price amazon'.
-        Returns titles, URLs and short snippets of the top results."""
+        """Search the live web. Input must be ONE search query that always contains
+        the full product name, for example: 'minimalist leather wallet price amazon'.
+        Never send single loose words. Returns titles, URLs and snippets."""
         query = (query or "").strip()
         if not query:
-            return "Empty query. Send a short search query."
+            return "Empty query. Send a search query that includes the product name."
+        query = ensure_product_in_query(query, product)
 
         with session.lock:
             if len(session.queries) >= MAX_SEARCHES:
@@ -181,6 +202,8 @@ def make_search_tool(session: SearchSession):
             session.queries.append(query)
 
         results, last_error = web_search_with_fallback(query, session)
+        with session.lock:
+            session.log.append((query, session.last_engine if results else "FAILED", len(results or [])))
 
         if results is None:
             return (
@@ -224,27 +247,40 @@ def build_llm(api_key: str) -> LLM:
 
 def build_task_description(product: str, region_name: str, competitors: str) -> str:
     region = REGIONS[region_name]
-    targets = competitors.strip() or "None given. Find the main competitors yourself."
-    return f"""Investigate this product or niche: "{product}"
+    named = competitors.strip()
+    targets = named or "None given. Find the main competitors yourself."
+    last_query = (
+        f'6. Named competitors: "{named} {product} price reviews"'
+        if named
+        else f'6. Premium tier: "premium high end {product} price"'
+    )
+    return f"""Investigate this specific e-commerce product: "{product}"
 
 Market focus: {region['market']}.
 Prices should be shown in: {region['currency']}.
 Competitors or URLs to target first: {targets}
 
-How to work (use at most {MAX_SEARCHES} searches, short queries, one topic per query):
-1. PRICES (2 searches): e.g. "{product} price", "best {product} under $100" and "{product} premium best". Look at the "Prices seen" lines.
-2. COMPETITORS (1 search): "best {product} brands".
-3. COMPLAINTS (2 searches): e.g. "{product} problems complaints reddit" and "{product} negative reviews wobble broke returned". Real customer words only.
-4. If the user gave competitors, spend the last search on them by name.
+CRITICAL SEARCH RULES:
+- EVERY search query must contain the full product name "{product}" (or its core words together).
+- NEVER search single loose words such as one word from the product name, and never search dictionary meanings.
+- Treat this strictly as a physical retail product that people buy online.
 
-Rules:
-- If the niche is vague, add shopping words and pick the most likely meaning (say which one).
+Search plan (use at most {MAX_SEARCHES} queries, in this order):
+1. "{product} buy price amazon store"
+2. "best {product} price range online shopping"
+3. "top brands {product} competitors"
+4. "{product} customer negative reviews problems complaints reddit"
+5. "{product} poor quality returned defect broke"
+{last_query}
+
+Rules for the report:
+- If the product name is vague, pick the most likely shopping meaning and say which one at the top.
 - Use ONLY facts found in search results. NEVER invent or "infer" prices, ranges, brands or quotes.
-- Prices: use only numbers shown in "Prices seen" or in a snippet. If you have fewer than 3 real prices, fill only the tiers you can prove and write "Not found in search results" for the rest. Do NOT write any price range outside the table that is not backed by a real number.
-- Complaints: only count something as a complaint if a snippet shows customers or reviewers saying it. An ad that says "easy assembly" is NOT a complaint. If evidence is thin, say "Weak evidence".
-- Cite by site name (for example "Reddit", "Amazon listing"). Do NOT use citation markers like 【1†L1-L3】 and do not invent URLs.
-- If Section 1 or 2 has little real data, say so at the top of that section, and keep Sections 3 and 4 clearly marked as "ideas based on limited data".
-- Be specific and practical. Short sentences. Simple words."""
+- Prices: use only numbers shown in "Prices seen" or in a snippet. With fewer than 3 real prices, fill only the proven tiers and write "Not found in search results" for the rest. No price range outside the table without a real number behind it.
+- Complaints: only count something as a complaint if a snippet shows customers or reviewers saying it. An ad saying "easy assembly" is NOT a complaint. If evidence is thin, write "Weak evidence".
+- Cite by site name (for example "Reddit", "Amazon listing"). No citation markers like 【1†L1-L3】. Do not invent URLs.
+- If Section 1 or 2 has little real data, say so at the top of that section and mark Sections 3 and 4 as "ideas based on limited data".
+- Short sentences. Simple words."""
 
 
 EXPECTED_OUTPUT = """A clean Markdown report with EXACTLY these four sections, in this order:
@@ -437,7 +473,7 @@ if run_clicked:
 
         try:
             crew = build_crew(
-                build_llm(api_key), make_search_tool(session), product_clean, region_name, competitors
+                build_llm(api_key), make_search_tool(session, product_clean), product_clean, region_name, competitors
             )
         except Exception as exc:
             st.error(friendly_error(exc))
@@ -486,6 +522,7 @@ if run_clicked:
                     sources = list(session.urls.items())
                     n_searches = len(session.queries)
                     search_errors = list(session.errors)
+                    search_log = list(session.log)
                 st.session_state["report"] = {
                     "product": product_clean,
                     "region": region_name,
@@ -494,6 +531,7 @@ if run_clicked:
                     "sources": sources,
                     "seconds": time.time() - started,
                     "errors": search_errors,
+                    "log": search_log,
                 }
 
 # --------------------------------------------------------------------------- #
@@ -516,6 +554,10 @@ if report:
             "are NOT real market data. Use the **🧪 Test web search** button in the sidebar. "
             "Try a more specific product name too."
         )
+    if report.get("log"):
+        with st.expander("🔎 Exact searches the agent ran"):
+            for q, engine, n in report["log"]:
+                st.markdown(f"- `{q}` → **{engine}**, {n} results")
     if report.get("errors"):
         with st.expander("Search problems (for debugging)"):
             st.code("\n".join(report["errors"][-12:]))
