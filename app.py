@@ -49,7 +49,8 @@ CREWAI_MODEL_STRING = "openai/openai/gpt-oss-120b"
 
 MAX_SEARCHES = 6          # hard cap per run (keeps Groq token usage low)
 RESULTS_PER_SEARCH = 5
-SNIPPET_CHARS = 240
+SNIPPET_CHARS = 420
+TAVILY_DEPTH = "basic"  # "advanced" gives richer text but costs 2 credits per search
 # If one search engine blocks us (common on cloud servers), try the next one.
 SEARCH_BACKENDS = ["brave", "duckduckgo", "yahoo", "startpage", "mojeek", "google"]
 # NOTE: do not use "auto" or the old "wt-wt" region: both fail in ddgs 9.x.
@@ -88,6 +89,23 @@ class SearchSession:
         self.lock = threading.Lock()
 
 
+PRICE_RE = re.compile(
+    r"(?:US\$|\$|£|€|Rs\.?\s?|PKR\s?)\s?\d[\d,]*(?:\.\d{1,2})?|\d[\d,]*(?:\.\d{1,2})?\s?(?:USD|PKR|GBP|EUR)\b"
+)
+
+
+def find_prices(text: str, limit: int = 6) -> list[str]:
+    """Pull price-looking strings out of a snippet so the agent sees real numbers."""
+    seen: list[str] = []
+    for m in PRICE_RE.finditer(text or ""):
+        value = " ".join(m.group(0).split())
+        if value not in seen:
+            seen.append(value)
+        if len(seen) >= limit:
+            break
+    return seen
+
+
 def _tavily_search(query: str, api_key: str, max_results: int):
     """Optional backup (free tier, no card). Returns results in ddgs format."""
     import httpx
@@ -95,7 +113,7 @@ def _tavily_search(query: str, api_key: str, max_results: int):
     resp = httpx.post(
         "https://api.tavily.com/search",
         headers={"Authorization": f"Bearer {api_key}"},
-        json={"query": query, "max_results": max_results, "search_depth": "basic"},
+        json={"query": query, "max_results": max_results, "search_depth": TAVILY_DEPTH},
         timeout=30,
     )
     resp.raise_for_status()
@@ -180,7 +198,9 @@ def make_search_tool(session: SearchSession):
             if url:
                 with session.lock:
                     session.urls.setdefault(url, title or url)
-            lines.append(f"{i}. {title}\n   URL: {url}\n   Snippet: {body}")
+            prices = find_prices(f"{title} {r.get('body') or ''}")
+            price_line = f"\n   Prices seen: {', '.join(prices)}" if prices else ""
+            lines.append(f"{i}. {title}\n   URL: {url}\n   Snippet: {body}{price_line}")
         return "\n".join(lines)
 
     return duckduckgo_search
@@ -211,17 +231,19 @@ Market focus: {region['market']}.
 Prices should be shown in: {region['currency']}.
 Competitors or URLs to target first: {targets}
 
-How to work (use at most {MAX_SEARCHES} searches, short queries):
-1. Search for live listings and prices (example: "{product} price buy").
-2. Search for top competitors / best-selling alternatives.
-3. Search for customer complaints (example: "{product} bad reviews problems").
-4. If the user gave competitors, search them by name.
+How to work (use at most {MAX_SEARCHES} searches, short queries, one topic per query):
+1. PRICES (2 searches): e.g. "{product} price", "best {product} under $100" and "{product} premium best". Look at the "Prices seen" lines.
+2. COMPETITORS (1 search): "best {product} brands".
+3. COMPLAINTS (2 searches): e.g. "{product} problems complaints reddit" and "{product} negative reviews wobble broke returned". Real customer words only.
+4. If the user gave competitors, spend the last search on them by name.
 
 Rules:
-- If the niche is vague (for example "working table"), add shopping words to the query such as "buy", "price", "amazon" and pick the most likely product meaning (say which one you picked).
-- Use ONLY facts found in search results. Never invent prices, brands or quotes.
-- If a price or complaint was not found, write "Not found in search results".
-- Mark numbers taken from snippets as "approx." and name the source site.
+- If the niche is vague, add shopping words and pick the most likely meaning (say which one).
+- Use ONLY facts found in search results. NEVER invent or "infer" prices, ranges, brands or quotes.
+- Prices: use only numbers shown in "Prices seen" or in a snippet. If you have fewer than 3 real prices, fill only the tiers you can prove and write "Not found in search results" for the rest. Do NOT write any price range outside the table that is not backed by a real number.
+- Complaints: only count something as a complaint if a snippet shows customers or reviewers saying it. An ad that says "easy assembly" is NOT a complaint. If evidence is thin, say "Weak evidence".
+- Cite by site name (for example "Reddit", "Amazon listing"). Do NOT use citation markers like 【1†L1-L3】 and do not invent URLs.
+- If Section 1 or 2 has little real data, say so at the top of that section, and keep Sections 3 and 4 clearly marked as "ideas based on limited data".
 - Be specific and practical. Short sentences. Simple words."""
 
 
@@ -304,8 +326,10 @@ def friendly_error(exc: Exception) -> str:
     return f"Something went wrong: {text[:500]}"
 
 
-def build_report_file(product: str, region_name: str, body: str) -> str:
+def build_report_file(product: str, region_name: str, body: str, sources=None) -> str:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if sources:
+        body += "\n\n### Pages the agent looked at\n" + "\n".join(f"- {t[:90]} - {u}" for u, t in sources)
     return (
         f"# E-commerce Spy Report: {product}\n\n"
         f"- Market: {region_name}\n- Generated: {stamp}\n\n---\n\n{body}\n\n---\n"
@@ -423,7 +447,7 @@ if run_clicked:
 
             def worker():
                 try:
-                    box["result"] = str(crew.kickoff().raw)
+                    box["result"] = re.sub(r"【[^】]*】", "", str(crew.kickoff().raw))
                 except Exception as exc:  # shown to the user below
                     box["error"] = exc
 
@@ -504,7 +528,7 @@ if report:
             for url, title in report["sources"]:
                 st.markdown(f"- [{title[:90]}]({url})")
 
-    file_text = build_report_file(report["product"], report["region"], report["body"])
+    file_text = build_report_file(report["product"], report["region"], report["body"], report["sources"])
     safe_name = "".join(ch if ch.isalnum() else "_" for ch in report["product"])[:40].strip("_") or "report"
     d1, d2 = st.columns(2)
     d1.download_button(
