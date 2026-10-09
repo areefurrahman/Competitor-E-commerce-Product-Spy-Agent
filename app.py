@@ -50,11 +50,12 @@ MAX_SEARCHES = 6          # hard cap per run (keeps Groq token usage low)
 RESULTS_PER_SEARCH = 5
 SNIPPET_CHARS = 240
 # If one search engine blocks us (common on cloud servers), try the next one.
-SEARCH_BACKENDS = ["auto", "brave", "duckduckgo", "yahoo", "startpage", "mojeek"]
+SEARCH_BACKENDS = ["brave", "duckduckgo", "yahoo", "startpage", "mojeek", "google"]
+# NOTE: do not use "auto" or the old "wt-wt" region: both fail in ddgs 9.x.
 
 REGIONS = {
     "Global": {
-        "code": "wt-wt",
+        "code": "us-en",
         "market": "the global online market (Amazon, eBay, AliExpress, Shopify brand stores)",
         "currency": "USD (or the currency shown by the source)",
     },
@@ -77,34 +78,65 @@ REGIONS = {
 class SearchSession:
     """Keeps track of what the agent searched. Thread-safe."""
 
-    def __init__(self, region_code: str):
+    def __init__(self, region_code: str, tavily_key: str = ""):
         self.region_code = region_code
+        self.tavily_key = tavily_key
         self.queries: list[str] = []
         self.urls: dict[str, str] = {}  # url -> title (keeps order)
         self.errors: list[str] = []     # search problems, shown in the UI
         self.lock = threading.Lock()
 
 
+def _tavily_search(query: str, api_key: str, max_results: int):
+    """Optional backup (free tier, no card). Returns results in ddgs format."""
+    import httpx
+
+    resp = httpx.post(
+        "https://api.tavily.com/search",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={"query": query, "max_results": max_results, "search_depth": "basic"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return [
+        {"title": r.get("title", ""), "href": r.get("url", ""), "body": r.get("content", "")}
+        for r in resp.json().get("results", [])
+    ]
+
+
 def web_search_with_fallback(query: str, session: "SearchSession", max_results: int = RESULTS_PER_SEARCH):
-    """Try several search engines one by one. Returns (results or None, last_error)."""
+    """Try search engines one by one. Returns (results or None, last_error)."""
     last_error = None
-    for backend in SEARCH_BACKENDS:
+    regions = [session.region_code] + (["us-en"] if session.region_code != "us-en" else [])
+    for region in regions:
+        for backend in SEARCH_BACKENDS:
+            try:
+                found = DDGS().text(
+                    query,
+                    region=region,
+                    safesearch="moderate",
+                    max_results=max_results,
+                    backend=backend,
+                )
+                if found:
+                    return found, None
+                last_error = RuntimeError("empty result")
+            except Exception as exc:  # blocked, rate limited, parse error...
+                last_error = exc
+            with session.lock:
+                session.errors.append(f"{backend}/{region}: {type(last_error).__name__}: {str(last_error)[:110]}")
+            time.sleep(0.3)
+
+    if session.tavily_key:
         try:
-            found = DDGS().text(
-                query,
-                region=session.region_code,
-                safesearch="off",
-                max_results=max_results,
-                backend=backend,
-            )
+            found = _tavily_search(query, session.tavily_key, max_results)
             if found:
                 return found, None
-            last_error = RuntimeError(f"{backend}: empty result")
-        except Exception as exc:  # blocked, rate limited, parse error...
+            last_error = RuntimeError("tavily: empty result")
+        except Exception as exc:
             last_error = exc
         with session.lock:
-            session.errors.append(f"{backend}: {type(last_error).__name__}: {str(last_error)[:120]}")
-        time.sleep(0.5)
+            session.errors.append(f"tavily: {type(last_error).__name__}: {str(last_error)[:110]}")
     return None, last_error
 
 
@@ -291,11 +323,23 @@ with st.sidebar:
         st.markdown("Get a free key at [console.groq.com](https://console.groq.com/keys).")
 
     region_name = st.selectbox("Market Region", list(REGIONS.keys()), index=0)
+
+    try:
+        tavily_key = str(st.secrets.get("TAVILY_API_KEY", "") or "").strip()
+    except Exception:
+        tavily_key = ""
+    if not tavily_key:
+        tavily_key = st.text_input(
+            "Backup search key (optional)",
+            type="password",
+            placeholder="tvly-...",
+            help="Only used if DuckDuckGo and other free engines are blocked. Free key at tavily.com.",
+        ).strip()
     st.caption("Model: `openai/gpt-oss-120b` on Groq")
-    st.caption(f"Search: DuckDuckGo + backup engines (max {MAX_SEARCHES} searches per run)")
+    st.caption(f"Search: DuckDuckGo + backups (max {MAX_SEARCHES} searches per run)")
 
     if st.button("🧪 Test web search", use_container_width=True):
-        test_session = SearchSession(REGIONS[region_name]["code"])
+        test_session = SearchSession(REGIONS[region_name]["code"], tavily_key)
         with st.spinner("Testing search engines..."):
             res, err = web_search_with_fallback("wireless earbuds price", test_session, 3)
         if res:
@@ -343,7 +387,7 @@ if run_clicked:
         if not api_key.startswith("gsk_"):
             st.warning("This key does not look like a Groq key (they start with `gsk_`). Trying anyway...")
 
-        session = SearchSession(REGIONS[region_name]["code"])
+        session = SearchSession(REGIONS[region_name]["code"], tavily_key)
         box = {"result": None, "error": None}
         started = time.time()
 
