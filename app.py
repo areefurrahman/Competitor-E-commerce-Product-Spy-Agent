@@ -107,6 +107,20 @@ def _tavily_search(query: str, api_key: str, max_results: int):
 def web_search_with_fallback(query: str, session: "SearchSession", max_results: int = RESULTS_PER_SEARCH):
     """Try search engines one by one. Returns (results or None, last_error)."""
     last_error = None
+
+    # 1) Tavily first when a key is set (free engines are often blocked on cloud servers).
+    if session.tavily_key:
+        try:
+            found = _tavily_search(query, session.tavily_key, max_results)
+            if found:
+                return found, None
+            last_error = RuntimeError("empty result")
+        except Exception as exc:
+            last_error = exc
+        with session.lock:
+            session.errors.append(f"tavily: {type(last_error).__name__}: {str(last_error)[:110]}")
+
+    # 2) Free engines (no key needed).
     regions = [session.region_code] + (["us-en"] if session.region_code != "us-en" else [])
     for region in regions:
         for backend in SEARCH_BACKENDS:
@@ -126,17 +140,6 @@ def web_search_with_fallback(query: str, session: "SearchSession", max_results: 
             with session.lock:
                 session.errors.append(f"{backend}/{region}: {type(last_error).__name__}: {str(last_error)[:110]}")
             time.sleep(0.3)
-
-    if session.tavily_key:
-        try:
-            found = _tavily_search(query, session.tavily_key, max_results)
-            if found:
-                return found, None
-            last_error = RuntimeError("tavily: empty result")
-        except Exception as exc:
-            last_error = exc
-        with session.lock:
-            session.errors.append(f"tavily: {type(last_error).__name__}: {str(last_error)[:110]}")
     return None, last_error
 
 
