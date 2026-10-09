@@ -49,6 +49,8 @@ CREWAI_MODEL_STRING = "openai/openai/gpt-oss-120b"
 MAX_SEARCHES = 6          # hard cap per run (keeps Groq token usage low)
 RESULTS_PER_SEARCH = 5
 SNIPPET_CHARS = 240
+# If one search engine blocks us (common on cloud servers), try the next one.
+SEARCH_BACKENDS = ["auto", "brave", "duckduckgo", "yahoo", "startpage", "mojeek"]
 
 REGIONS = {
     "Global": {
@@ -79,7 +81,31 @@ class SearchSession:
         self.region_code = region_code
         self.queries: list[str] = []
         self.urls: dict[str, str] = {}  # url -> title (keeps order)
+        self.errors: list[str] = []     # search problems, shown in the UI
         self.lock = threading.Lock()
+
+
+def web_search_with_fallback(query: str, session: "SearchSession", max_results: int = RESULTS_PER_SEARCH):
+    """Try several search engines one by one. Returns (results or None, last_error)."""
+    last_error = None
+    for backend in SEARCH_BACKENDS:
+        try:
+            found = DDGS().text(
+                query,
+                region=session.region_code,
+                safesearch="off",
+                max_results=max_results,
+                backend=backend,
+            )
+            if found:
+                return found, None
+            last_error = RuntimeError(f"{backend}: empty result")
+        except Exception as exc:  # blocked, rate limited, parse error...
+            last_error = exc
+        with session.lock:
+            session.errors.append(f"{backend}: {type(last_error).__name__}: {str(last_error)[:120]}")
+        time.sleep(0.5)
+    return None, last_error
 
 
 def make_search_tool(session: SearchSession):
@@ -100,24 +126,12 @@ def make_search_tool(session: SearchSession):
                 )
             session.queries.append(query)
 
-        results, last_error = None, None
-        for attempt in range(3):
-            try:
-                results = DDGS().text(
-                    query,
-                    region=session.region_code,
-                    safesearch="off",
-                    max_results=RESULTS_PER_SEARCH,
-                )
-                break
-            except Exception as exc:  # network, rate limit, parsing...
-                last_error = exc
-                time.sleep(1.5 * (attempt + 1))
+        results, last_error = web_search_with_fallback(query, session)
 
         if results is None:
             return (
                 f"Search failed ({type(last_error).__name__}). "
-                "Try a different query, or continue with the data you already have."
+                "Try a different, simpler query, or continue with the data you already have."
             )
         if not results:
             return "No results. Try a different, simpler query."
@@ -168,6 +182,7 @@ How to work (use at most {MAX_SEARCHES} searches, short queries):
 4. If the user gave competitors, search them by name.
 
 Rules:
+- If the niche is vague (for example "working table"), add shopping words to the query such as "buy", "price", "amazon" and pick the most likely product meaning (say which one you picked).
 - Use ONLY facts found in search results. Never invent prices, brands or quotes.
 - If a price or complaint was not found, write "Not found in search results".
 - Mark numbers taken from snippets as "approx." and name the source site.
@@ -276,8 +291,20 @@ with st.sidebar:
         st.markdown("Get a free key at [console.groq.com](https://console.groq.com/keys).")
 
     region_name = st.selectbox("Market Region", list(REGIONS.keys()), index=0)
-    st.caption(f"Model: `{'openai/gpt-oss-120b'}` on Groq")
-    st.caption(f"Search: DuckDuckGo (max {MAX_SEARCHES} searches per run)")
+    st.caption("Model: `openai/gpt-oss-120b` on Groq")
+    st.caption(f"Search: DuckDuckGo + backup engines (max {MAX_SEARCHES} searches per run)")
+
+    if st.button("🧪 Test web search", use_container_width=True):
+        test_session = SearchSession(REGIONS[region_name]["code"])
+        with st.spinner("Testing search engines..."):
+            res, err = web_search_with_fallback("wireless earbuds price", test_session, 3)
+        if res:
+            st.success(f"Search works ✅ ({len(res)} results)")
+        else:
+            st.error("Search is blocked or empty ❌")
+        if test_session.errors:
+            with st.expander("Engine details"):
+                st.code("\n".join(test_session.errors))
 
 # --------------------------------------------------------------------------- #
 # Main area
@@ -370,6 +397,7 @@ if run_clicked:
                 with session.lock:
                     sources = list(session.urls.items())
                     n_searches = len(session.queries)
+                    search_errors = list(session.errors)
                 st.session_state["report"] = {
                     "product": product_clean,
                     "region": region_name,
@@ -377,6 +405,7 @@ if run_clicked:
                     "searches": n_searches,
                     "sources": sources,
                     "seconds": time.time() - started,
+                    "errors": search_errors,
                 }
 
 # --------------------------------------------------------------------------- #
@@ -392,6 +421,16 @@ if report:
     c2.metric("Unique sources", len(report["sources"]))
     c3.metric("Time taken", f"{report['seconds']:.0f}s")
     c4.metric("Market", report["region"].split(" /")[0])
+
+    if not report["sources"]:
+        st.warning(
+            "⚠️ The web search returned **no pages**. Sections about prices and complaints "
+            "are NOT real market data. Use the **🧪 Test web search** button in the sidebar. "
+            "Try a more specific product name too."
+        )
+    if report.get("errors"):
+        with st.expander("Search problems (for debugging)"):
+            st.code("\n".join(report["errors"][-12:]))
 
     with st.container(border=True):
         st.markdown(report["body"])
