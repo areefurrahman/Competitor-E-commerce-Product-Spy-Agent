@@ -12,6 +12,7 @@ os.environ.setdefault("CREWAI_DISABLE_TRACKING", "true")
 os.environ.setdefault("CREWAI_TRACING_ENABLED", "false")
 os.environ.setdefault("OTEL_SDK_DISABLED", "true")
 
+import re
 import threading
 import time
 from datetime import datetime
@@ -272,6 +273,13 @@ def build_crew(llm: LLM, search_tool, product: str, region_name: str, competitor
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def clean_key(raw: str, prefix: str) -> str:
+    """Pull a clean ASCII key out of messy pasted text (quotes, spaces, extra lines).
+    Returns "" if no valid-looking key is found."""
+    match = re.search(re.escape(prefix) + r"[A-Za-z0-9_\-]{10,}", raw or "")
+    return match.group(0) if match else ""
+
+
 def get_secret_key() -> str:
     try:
         return str(st.secrets.get("GROQ_API_KEY", "") or "").strip()
@@ -314,30 +322,39 @@ with st.sidebar:
 
     secret_key = get_secret_key()
     if secret_key:
-        api_key = secret_key
-        st.success("Groq API key loaded from secrets ✅")
+        api_key = clean_key(secret_key, "gsk_")
+        if api_key:
+            st.success("Groq API key loaded from secrets ✅")
+        else:
+            st.error("GROQ_API_KEY in secrets looks wrong. It must start with gsk_ and have no extra text.")
     else:
         api_key = st.text_input(
             "Groq API Key",
             type="password",
             placeholder="gsk_...",
             help="Your key is used only for this session and is never saved.",
-        ).strip()
+        )
+        api_key = clean_key(api_key, "gsk_") or api_key.strip().encode("ascii", "ignore").decode()
         st.markdown("Get a free key at [console.groq.com](https://console.groq.com/keys).")
 
     region_name = st.selectbox("Market Region", list(REGIONS.keys()), index=0)
 
     try:
-        tavily_key = str(st.secrets.get("TAVILY_API_KEY", "") or "").strip()
+        raw_tavily = str(st.secrets.get("TAVILY_API_KEY", "") or "")
     except Exception:
-        tavily_key = ""
-    if not tavily_key:
-        tavily_key = st.text_input(
+        raw_tavily = ""
+    if not raw_tavily.strip():
+        raw_tavily = st.text_input(
             "Backup search key (optional)",
             type="password",
             placeholder="tvly-...",
-            help="Only used if DuckDuckGo and other free engines are blocked. Free key at tavily.com.",
-        ).strip()
+            help="Used first when set. Free key at tavily.com.",
+        )
+    tavily_key = clean_key(raw_tavily, "tvly-")
+    if raw_tavily.strip() and not tavily_key:
+        st.error("Tavily key looks wrong. It must start with tvly- and contain no quotes or extra text.")
+    elif tavily_key:
+        st.caption("Backup search key ready ✅")
     st.caption("Model: `openai/gpt-oss-120b` on Groq")
     st.caption(f"Search: DuckDuckGo + backups (max {MAX_SEARCHES} searches per run)")
 
